@@ -539,6 +539,32 @@ function initPlanTripForm() {
     state.currentTripId = newTrip.id;
     state.selectedDayNumber = 1;
 
+    const initialBudget = {
+      total: newTrip.budgetAmount,
+      categories: {
+        Stay: { name: '🏨 Stays & Rooms', allocated: Math.round(newTrip.budgetAmount * 0.4), spent: 0, colorClass: 'cat-stay' },
+        Food: { name: '🍜 Cafes & Dining', allocated: Math.round(newTrip.budgetAmount * 0.25), spent: 0, colorClass: 'cat-food' },
+        Activities: { name: '🎟️ Sights & Tours', allocated: Math.round(newTrip.budgetAmount * 0.15), spent: 0, colorClass: 'cat-activities' },
+        Transport: { name: '🚄 Travel & Transit', allocated: Math.round(newTrip.budgetAmount * 0.12), spent: 0, colorClass: 'cat-transport' },
+        Shopping: { name: '🛍️ Souvenirs & Gifts', allocated: Math.round(newTrip.budgetAmount * 0.08), spent: 0, colorClass: 'cat-shopping' }
+      },
+      expenses: []
+    };
+
+    // Save to Backend API
+    if (window.TravelMateAPI) {
+      TravelMateAPI.createTrip(newTrip).catch(() => {});
+      TravelMateAPI.saveItinerary(newTrip.id, newTrip.days).catch(() => {});
+      TravelMateAPI.saveBudget(newTrip.id, initialBudget).catch(() => {});
+    }
+
+    // Fallback sync to local DB
+    if (window.TravelMateDB) {
+      TravelMateDB.saveTrip(newTrip);
+      TravelMateDB.saveItineraryDays(newTrip.id, newTrip.days);
+      TravelMateDB.saveBudget(newTrip.id, initialBudget);
+    }
+
     showToast(`Trip to "${newTrip.destination}" saved to Scrapbook! 🌸`);
     navigateTo('itinerary');
   });
@@ -714,12 +740,16 @@ function initPackingList() {
     const text = input.value.trim();
 
     if (text) {
-      state.packingItems.push({
+      const newItem = {
         id: Date.now(),
         category: cat,
         text: text,
         done: false
-      });
+      };
+      state.packingItems.push(newItem);
+      if (window.TravelMateDB) {
+        TravelMateDB.savePackingItem(state.currentTripId, newItem);
+      }
       input.value = '';
       renderPackingList();
       showToast('Added to your packing bag! 🎒');
@@ -779,6 +809,9 @@ function togglePackingItem(itemId) {
   const item = state.packingItems.find(i => i.id === itemId);
   if (item) {
     item.done = !item.done;
+    if (window.TravelMateDB) {
+      TravelMateDB.savePackingItem(state.currentTripId, item);
+    }
     renderPackingList();
   }
 }
@@ -786,6 +819,9 @@ function togglePackingItem(itemId) {
 function deletePackingItem(event, itemId) {
   event.stopPropagation();
   state.packingItems = state.packingItems.filter(i => i.id !== itemId);
+  if (window.TravelMateDB) {
+    TravelMateDB.deletePackingItem(itemId);
+  }
   renderPackingList();
   showToast('Item removed 🗑️');
 }
@@ -812,6 +848,10 @@ function initBudget() {
       // Update category spent
       if (state.budget.categories[cat]) {
         state.budget.categories[cat].spent += amount;
+      }
+
+      if (window.TravelMateDB) {
+        TravelMateDB.saveBudget(state.currentTripId, state.budget);
       }
 
       form.reset();
@@ -887,7 +927,8 @@ function renderMyTrips() {
           <span class="badge badge-teal">${trip.currency}${trip.budgetAmount}</span>
         </div>
         <div class="trip-card-footer">
-          <button class="btn btn-sm btn-pink" onclick="openTripItinerary('${trip.id}')">📖 Open Itinerary</button>
+          <button class="btn btn-sm btn-pink" onclick="openTripItinerary('${trip.id}')">📖 Itinerary</button>
+          <button class="btn btn-sm btn-yellow" onclick="editTrip('${trip.id}')" title="Edit Trip">✏️ Edit</button>
           <button class="btn btn-sm btn-outline" onclick="deleteTrip('${trip.id}')" title="Delete">🗑️</button>
         </div>
       </div>
@@ -901,13 +942,36 @@ function openTripItinerary(tripId) {
   navigateTo('itinerary');
 }
 
-function deleteTrip(tripId) {
+async function editTrip(tripId) {
+  const trip = state.trips.find(t => t.id === tripId);
+  if (!trip) return;
+  const newTitle = prompt('Edit Trip Title:', trip.title);
+  if (newTitle && newTitle.trim()) {
+    trip.title = newTitle.trim();
+    if (window.TravelMateAPI) {
+      await TravelMateAPI.updateTrip(tripId, { title: trip.title }).catch(() => {});
+    }
+    if (window.TravelMateDB) {
+      await TravelMateDB.saveTrip(trip);
+    }
+    renderMyTrips();
+    showToast('Trip updated! ✏️');
+  }
+}
+
+async function deleteTrip(tripId) {
   if (state.trips.length <= 1) {
     alert('Keep at least one trip in your scrapbook journal!');
     return;
   }
   if (confirm('Are you sure you want to remove this trip from your journal?')) {
     state.trips = state.trips.filter(t => t.id !== tripId);
+    if (window.TravelMateAPI) {
+      await TravelMateAPI.deleteTrip(tripId).catch(() => {});
+    }
+    if (window.TravelMateDB) {
+      await TravelMateDB.deleteTrip(tripId);
+    }
     if (state.currentTripId === tripId) {
       state.currentTripId = state.trips[0].id;
     }
@@ -964,13 +1028,75 @@ function quickPlanDestination(destName) {
   showToast(`Loaded ${destName} into your planner! ✏️`);
 }
 
-// ================= APP INITIALIZATION =================
-document.addEventListener('DOMContentLoaded', () => {
+// ================= APP INITIALIZATION WITH BACKEND & DATABASE =================
+document.addEventListener('DOMContentLoaded', async () => {
   initNavigation();
   initPlanTripForm();
   initPackingList();
   initBudget();
   initDestinations();
+
+  let backendConnected = false;
+
+  // 1. Try loading from Backend API (frontend -> backend -> database)
+  if (window.TravelMateAPI) {
+    try {
+      const backendTrips = await TravelMateAPI.getTrips();
+      if (backendTrips && Array.isArray(backendTrips) && backendTrips.length > 0) {
+        state.trips = backendTrips;
+        state.currentTripId = backendTrips[0].id;
+
+        const itin = await TravelMateAPI.getItinerary(state.currentTripId);
+        if (itin && itin.length > 0) {
+          state.trips[0].days = itin;
+        }
+
+        const pack = await TravelMateAPI.getPacking(state.currentTripId);
+        if (pack && pack.length > 0) {
+          state.packingItems = pack;
+        }
+
+        const bgt = await TravelMateAPI.getBudget(state.currentTripId);
+        if (bgt && bgt.categories) {
+          state.budget = bgt;
+        }
+
+        backendConnected = true;
+      }
+    } catch (e) {
+      // Backend not running yet or offline
+    }
+  }
+
+  // 2. Fallback to local DB if backend was not connected
+  if (!backendConnected && window.TravelMateDB) {
+    try {
+      await TravelMateDB.init();
+      const storedTrips = await TravelMateDB.getAllTrips();
+
+      if (storedTrips && storedTrips.length > 0) {
+        state.trips = storedTrips;
+        state.currentTripId = storedTrips[0].id;
+
+        const storedDays = await TravelMateDB.getItinerary(state.currentTripId);
+        if (storedDays && storedDays.length > 0) {
+          state.trips[0].days = storedDays;
+        }
+
+        const storedPacking = await TravelMateDB.getPackingItems(state.currentTripId);
+        if (storedPacking && storedPacking.length > 0) {
+          state.packingItems = storedPacking;
+        }
+
+        const storedBudget = await TravelMateDB.getBudget(state.currentTripId);
+        if (storedBudget && storedBudget.categories) {
+          state.budget = storedBudget;
+        }
+      }
+    } catch (err) {
+      console.warn('Local DB error:', err);
+    }
+  }
 
   // Render initial view components
   renderItinerary();
