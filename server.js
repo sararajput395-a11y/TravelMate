@@ -1,12 +1,32 @@
 /**
  * TravelMate Minimal Backend Server
  * Uses Node.js built-in modules (http, fs, path). No external dependencies required.
+ * Integrates Groq AI model: openai/gpt-oss-120b
  */
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = 3000;
+// Load .env variables without external dependencies
+function loadEnv() {
+  const envPath = path.join(__dirname, '.env');
+  if (fs.existsSync(envPath)) {
+    const lines = fs.readFileSync(envPath, 'utf-8').split(/\r?\n/);
+    for (const line of lines) {
+      const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+      if (match) {
+        const key = match[1];
+        let value = match[2] || '';
+        if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+        if (value.startsWith("'") && value.endsWith("'")) value = value.slice(1, -1);
+        process.env[key] = value.trim();
+      }
+    }
+  }
+}
+loadEnv();
+
+const PORT = parseInt(process.env.PORT, 10) || 3000;
 const DB_FILE = path.join(__dirname, 'database.json');
 
 // Initial seed data if database.json does not exist
@@ -194,6 +214,44 @@ function serveStatic(res, filePath, contentType) {
   });
 }
 
+// Groq AI Request with Retry Handling
+async function callGroqWithRetry(apiKey, payload, retries = 2) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        if (attempt < retries && (response.status === 429 || response.status >= 500)) {
+          await new Promise(r => setTimeout(r, 1000 * attempt));
+          continue;
+        }
+        let parsedErr = errorText;
+        try {
+          const errObj = JSON.parse(errorText);
+          parsedErr = errObj.error?.message || errorText;
+        } catch (_) {}
+        throw new Error(`Groq API error (${response.status}): ${parsedErr}`);
+      }
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) throw new Error('No content returned from Groq model');
+      return JSON.parse(content);
+    } catch (err) {
+      if (attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, 1200 * attempt));
+    }
+  }
+}
+
 // Server Dispatcher
 const server = http.createServer(async (req, res) => {
   // CORS Preflight
@@ -209,6 +267,166 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
   const db = loadDatabase();
+
+  // --- 0. GROQ AI GENERATE TRIP ENDPOINT ---
+  if ((pathname === '/generate-trip' || pathname === '/api/generate-trip') && req.method === 'POST') {
+    try {
+      const params = await parseBody(req);
+      const apiKey = process.env.XAI_API_KEY || process.env.GROQ_API_KEY;
+
+      if (!apiKey || apiKey === '$$$$$' || apiKey.trim() === '') {
+        return sendJSON(res, 400, {
+          error: 'Missing or placeholder Groq API key. Please replace XAI_API_KEY=$$$$$ in .env with your real Groq API key.',
+          isConfigError: true
+        });
+      }
+
+      const duration = parseInt(params.durationDays, 10) || 3;
+      const budget = parseFloat(params.budgetAmount) || 2000;
+      const destination = params.destination || 'Kyoto, Japan';
+
+      const promptUser = `Create a complete travel plan for:
+Destination: ${destination}
+Dates: ${params.departureDate} to ${params.returnDate} (${duration} days)
+Travellers: ${params.travellerCount || 2} (${params.travellerType || 'couple'})
+Travel Style: ${params.travelStyle || 'Romantic & Scenic'}
+Accommodation Preference: ${params.accommodation || 'Boutique Hotel'}
+Pace: ${params.pace || 'Balanced'}
+Budget: ${params.currency || '$'}${budget}
+Notes/Wishes: ${params.notes || 'None'}
+
+Return ONLY a valid JSON object matching this exact structure:
+{
+  "tripSummary": "A cute 2-sentence summary of the voyage.",
+  "days": [
+    {
+      "dayNumber": 1,
+      "dateLabel": "Day 1",
+      "city": "Specific neighborhood/area",
+      "hotel": "Hotel name matching accommodation preference",
+      "morning": {
+        "time": "9:00 AM - 12:00 PM",
+        "activities": [
+          { "title": "Activity name", "desc": "Brief 1-line description", "tag": "Sight/Coffee/Walk" }
+        ]
+      },
+      "afternoon": {
+        "time": "1:30 PM - 5:00 PM",
+        "activities": [
+          { "title": "Activity name", "desc": "Brief 1-line description", "tag": "Explore/Museum/Shop" }
+        ]
+      },
+      "evening": {
+        "time": "6:30 PM - 9:30 PM",
+        "activities": [
+          { "title": "Activity name", "desc": "Brief 1-line description", "tag": "Dinner/Sunset/Relax" }
+        ]
+      }
+    }
+  ],
+  "packingSuggestions": [
+    { "category": "essentials", "text": "Specific item" },
+    { "category": "clothing", "text": "Clothing item tailored to expected seasonal weather in ${destination}" },
+    { "category": "electronics", "text": "Tech or gadget item" },
+    { "category": "toiletries", "text": "Care or skincare item for travel weather" },
+    { "category": "fun", "text": "Journal, stickers, or travel souvenir item" }
+  ],
+  "budgetBreakdown": {
+    "total": ${budget},
+    "categories": {
+      "Stay": { "name": "🏨 Stays & Accommodation", "allocated": ${Math.round(budget * 0.4)}, "spent": 0, "colorClass": "cat-stay" },
+      "Food": { "name": "🍜 Cafes & Dining", "allocated": ${Math.round(budget * 0.25)}, "spent": 0, "colorClass": "cat-food" },
+      "Activities": { "name": "🎟️ Tours & Sights", "allocated": ${Math.round(budget * 0.15)}, "spent": 0, "colorClass": "cat-activities" },
+      "Transport": { "name": "🚄 Transit & Travel", "allocated": ${Math.round(budget * 0.12)}, "spent": 0, "colorClass": "cat-transport" },
+      "Shopping": { "name": "🛍️ Souvenirs & Treats", "allocated": ${Math.round(budget * 0.08)}, "spent": 0, "colorClass": "cat-shopping" }
+    }
+  }
+}
+Generate all ${duration} days in the "days" array. Keep activities delightful and appropriate for ${destination}.`;
+
+      // Call Groq API with specified model openai/gpt-oss-120b
+      const groqPayload = {
+        model: 'openai/gpt-oss-120b',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are TravelMate AI, a warm and helpful travel planner. You generate structured travel plans with weather-aware packing suggestions, realistic day-by-day itineraries, and budget breakdowns. Always output ONLY a valid JSON object without markdown fences or additional prose.'
+          },
+          {
+            role: 'user',
+            content: promptUser
+          }
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.7
+      };
+
+      const aiData = await callGroqWithRetry(apiKey, groqPayload, 2);
+
+      // Create new trip object
+      const tripId = 'trip-' + Date.now();
+      const newTrip = {
+        id: tripId,
+        title: `${destination} Voyage ✨`,
+        destination: destination,
+        departureDate: params.departureDate,
+        returnDate: params.returnDate,
+        durationDays: duration,
+        travellerType: params.travellerType || 'couple',
+        travellerCount: parseInt(params.travellerCount, 10) || 2,
+        travelStyle: params.travelStyle || 'Romantic & Scenic',
+        accommodation: params.accommodation || 'Boutique Hotel',
+        pace: params.pace || 'Balanced',
+        budgetAmount: budget,
+        currency: params.currency || '$',
+        coverImage: 'https://images.unsplash.com/photo-1488646953014-85cb44e25828?w=700&auto=format&fit=crop&q=80',
+        status: 'AI Curated 🌸',
+        notes: aiData.tripSummary || params.notes || 'Generated with Groq AI'
+      };
+
+      // Format packing items
+      const packingList = (aiData.packingSuggestions || []).map((item, idx) => ({
+        id: Date.now() + idx,
+        category: item.category || 'essentials',
+        text: item.text,
+        done: false
+      }));
+
+      // Format budget
+      const budgetData = aiData.budgetBreakdown || {
+        total: budget,
+        categories: {
+          Stay: { name: '🏨 Stays & Accommodation', allocated: Math.round(budget * 0.4), spent: 0, colorClass: 'cat-stay' },
+          Food: { name: '🍜 Cafes & Dining', allocated: Math.round(budget * 0.25), spent: 0, colorClass: 'cat-food' },
+          Activities: { name: '🎟️ Tours & Sights', allocated: Math.round(budget * 0.15), spent: 0, colorClass: 'cat-activities' },
+          Transport: { name: '🚄 Transit & Travel', allocated: Math.round(budget * 0.12), spent: 0, colorClass: 'cat-transport' },
+          Shopping: { name: '🛍️ Souvenirs & Treats', allocated: Math.round(budget * 0.08), spent: 0, colorClass: 'cat-shopping' }
+        },
+        expenses: []
+      };
+
+      // Save to existing database.json
+      db.trips.unshift(newTrip);
+      db.itinerary[tripId] = aiData.days || [];
+      db.packing[tripId] = packingList;
+      db.budget[tripId] = budgetData;
+      saveDatabase(db);
+
+      return sendJSON(res, 200, {
+        success: true,
+        trip: newTrip,
+        days: aiData.days || [],
+        packing: packingList,
+        budget: budgetData
+      });
+    } catch (err) {
+      console.error('Groq generation error:', err);
+      return sendJSON(res, 500, {
+        error: err.message || 'Failed to generate trip with Groq AI',
+        canRetry: true
+      });
+    }
+  }
 
   // --- API ROUTES ---
 

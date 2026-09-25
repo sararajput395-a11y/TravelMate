@@ -503,8 +503,8 @@ function initPlanTripForm() {
   styleSelect.addEventListener('change', updateLivePreview);
   paceSelect.addEventListener('change', updateLivePreview);
 
-  // Form Submission
-  form.addEventListener('submit', (e) => {
+  // Form Submission connected to backend /generate-trip (Groq AI)
+  form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const daysCount = calculateDuration();
     if (daysCount <= 0) {
@@ -512,15 +512,21 @@ function initPlanTripForm() {
       return;
     }
 
-    const newTrip = {
-      id: 'trip-' + Date.now(),
-      title: `${destInput.value} Holiday ✨`,
-      destination: destInput.value,
+    const submitBtn = form.querySelector('button[type="submit"]');
+    const originalBtnText = submitBtn.innerHTML;
+
+    // Loading State
+    submitBtn.disabled = true;
+    submitBtn.innerHTML = '✨ Brewing with Groq AI... ☕';
+    showToast('Brewing your trip with Groq AI... 🌸');
+
+    const preferences = {
+      destination: destInput.value.trim(),
       departureDate: depInput.value,
       returnDate: retInput.value,
       durationDays: daysCount,
       travellerType: document.getElementById('travellerType').value,
-      travellerCount: parseInt(travellersInput.value, 10),
+      travellerCount: parseInt(travellersInput.value, 10) || 2,
       travelStyle: styleSelect.value,
       accommodation: document.getElementById('accommodationType').value,
       pace: paceSelect.value,
@@ -528,45 +534,54 @@ function initPlanTripForm() {
       currency: document.getElementById('budgetCurrency').value === 'JPY' ? '¥' :
                 document.getElementById('budgetCurrency').value === 'EUR' ? '€' :
                 document.getElementById('budgetCurrency').value === 'GBP' ? '£' : '$',
-      coverImage: 'https://images.unsplash.com/photo-1488646953014-85cb44e25828?w=700&auto=format&fit=crop&q=80',
-      status: 'Ready to Pack 🎒',
-      notes: document.getElementById('tripNotes').value || 'Collect pastel memories!',
-      days: generateMockDays(destInput.value, daysCount, document.getElementById('accommodationType').value)
+      notes: document.getElementById('tripNotes').value.trim()
     };
 
-    // Add to state and set active
-    state.trips.unshift(newTrip);
-    state.currentTripId = newTrip.id;
-    state.selectedDayNumber = 1;
+    try {
+      let aiTripData = null;
 
-    const initialBudget = {
-      total: newTrip.budgetAmount,
-      categories: {
-        Stay: { name: '🏨 Stays & Rooms', allocated: Math.round(newTrip.budgetAmount * 0.4), spent: 0, colorClass: 'cat-stay' },
-        Food: { name: '🍜 Cafes & Dining', allocated: Math.round(newTrip.budgetAmount * 0.25), spent: 0, colorClass: 'cat-food' },
-        Activities: { name: '🎟️ Sights & Tours', allocated: Math.round(newTrip.budgetAmount * 0.15), spent: 0, colorClass: 'cat-activities' },
-        Transport: { name: '🚄 Travel & Transit', allocated: Math.round(newTrip.budgetAmount * 0.12), spent: 0, colorClass: 'cat-transport' },
-        Shopping: { name: '🛍️ Souvenirs & Gifts', allocated: Math.round(newTrip.budgetAmount * 0.08), spent: 0, colorClass: 'cat-shopping' }
-      },
-      expenses: []
-    };
+      // 1. Call Backend /generate-trip (Groq AI with openai/gpt-oss-120b)
+      if (window.TravelMateAPI && window.TravelMateAPI.generateTrip) {
+        aiTripData = await TravelMateAPI.generateTrip(preferences);
+      }
 
-    // Save to Backend API
-    if (window.TravelMateAPI) {
-      TravelMateAPI.createTrip(newTrip).catch(() => {});
-      TravelMateAPI.saveItinerary(newTrip.id, newTrip.days).catch(() => {});
-      TravelMateAPI.saveBudget(newTrip.id, initialBudget).catch(() => {});
+      if (aiTripData && aiTripData.success) {
+        const newTrip = aiTripData.trip;
+        newTrip.days = aiTripData.days;
+
+        // Update state
+        state.trips.unshift(newTrip);
+        state.currentTripId = newTrip.id;
+        state.selectedDayNumber = 1;
+        state.packingItems = aiTripData.packing;
+        state.budget = aiTripData.budget;
+
+        // Sync to local DB
+        if (window.TravelMateDB) {
+          TravelMateDB.saveTrip(newTrip);
+          TravelMateDB.saveItineraryDays(newTrip.id, newTrip.days);
+          TravelMateDB.saveBudget(newTrip.id, aiTripData.budget);
+          for (const item of aiTripData.packing) {
+            TravelMateDB.savePackingItem(newTrip.id, item);
+          }
+        }
+
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = originalBtnText;
+        showToast(`✨ Trip to "${newTrip.destination}" generated with Groq AI! 🌸`);
+        navigateTo('itinerary');
+      } else {
+        throw new Error('Unexpected response format from backend');
+      }
+    } catch (err) {
+      console.error('Trip generation error:', err);
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = '🔄 Retry Generating Trip';
+      
+      const errMsg = err.message || 'Error communicating with Groq AI';
+      showToast(`⚠️ ${errMsg}`);
+      alert(`⚠️ Trip Generation Notice:\n${errMsg}\n\nMake sure your server is running (npm start) and a valid Groq API key is set in .env as XAI_API_KEY=...`);
     }
-
-    // Fallback sync to local DB
-    if (window.TravelMateDB) {
-      TravelMateDB.saveTrip(newTrip);
-      TravelMateDB.saveItineraryDays(newTrip.id, newTrip.days);
-      TravelMateDB.saveBudget(newTrip.id, initialBudget);
-    }
-
-    showToast(`Trip to "${newTrip.destination}" saved to Scrapbook! 🌸`);
-    navigateTo('itinerary');
   });
 }
 

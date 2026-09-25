@@ -79,6 +79,20 @@ const TravelMateAPI = {
       body: JSON.stringify(budgetData)
     });
     return res.json();
+  },
+
+  // Groq AI Trip Generation
+  async generateTrip(preferences) {
+    const res = await fetch('/generate-trip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(preferences)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || `HTTP error ${res.status}`);
+    }
+    return data;
   }
 };
 
